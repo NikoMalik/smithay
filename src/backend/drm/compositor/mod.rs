@@ -1093,7 +1093,7 @@ where
     signaled_fence: Option<Arc<OwnedFd>>,
     allow_tearing: bool,
     async_flip_failed: bool,
-
+    async_flip_seen: bool,
     framebuffer_exporter: F,
 
     current_frame: CompositorFrameState<A, F>,
@@ -1280,6 +1280,7 @@ where
                         reset_pending: true,
                         allow_tearing: false,
                         async_flip_failed: false,
+                        async_flip_seen: false,
                         signaled_fence,
                         current_frame,
                         pending_frame: None,
@@ -1464,6 +1465,7 @@ where
             reset_pending: true,
             allow_tearing: false,
             async_flip_failed: false,
+            async_flip_seen: false,
             signaled_fence,
             current_frame,
             pending_frame: None,
@@ -2599,7 +2601,13 @@ where
                 warn!("error waiting for an async flip's buffer: {err:?}");
             }
             match self.surface.page_flip_async(self.surface.plane(), fb, true) {
-                Ok(()) => Ok(()),
+                Ok(()) => {
+                    if !self.async_flip_seen {
+                        self.async_flip_seen = true;
+                        info!("async page flips (tearing) work on this output");
+                    }
+                    Ok(())
+                }
                 Err(err) => {
                     warn!("async page flip refused, tearing off until asked again: {err}");
                     self.async_flip_failed = true;
@@ -2805,6 +2813,7 @@ where
     pub fn set_allow_tearing(&mut self, allow: bool) {
         if allow != self.allow_tearing {
             self.async_flip_failed = false;
+            self.async_flip_seen = false;
         }
         self.allow_tearing = allow;
     }
