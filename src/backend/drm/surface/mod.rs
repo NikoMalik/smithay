@@ -454,6 +454,19 @@ impl DrmSurface {
         &self.planes
     }
 
+    #[profiling::function]
+    pub fn page_flip_async(
+        &self,
+        plane: plane::Handle,
+        fb: framebuffer::Handle,
+        event: bool,
+    ) -> Result<(), Error> {
+        match &*self.internal {
+            DrmSurfaceInternal::Atomic(surf) => surf.page_flip_async(plane, fb, event),
+            DrmSurfaceInternal::Legacy(_) => Err(Error::UnsupportedPlaneConfiguration(plane)),
+        }
+    }
+
     /// Claim a plane so that it won't be used by a different crtc
     ///  
     /// Returns `None` if the plane could not be claimed
