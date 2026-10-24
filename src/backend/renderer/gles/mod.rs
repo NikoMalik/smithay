@@ -3094,10 +3094,12 @@ impl GlesFrame<'_, '_> {
             gl.DisableVertexAttribArray(program.attrib_vert_position as u32);
             drop(scope);
 
-            if self.renderer.capabilities.contains(&Capability::Fencing) {
-                sync_lock.update_read(gl);
-            } else if self.renderer.egl.is_shared() {
-                gl.Finish();
+            if self.renderer.egl.is_shared() {
+                if self.renderer.capabilities.contains(&Capability::Fencing) {
+                    sync_lock.update_read(gl);
+                } else {
+                    gl.Finish();
+                }
             };
         }
 
