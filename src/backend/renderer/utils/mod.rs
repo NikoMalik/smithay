@@ -219,18 +219,17 @@ impl<N: Coordinate, Kind> DamageSnapshot<N, Kind> {
     }
 
     fn add(&mut self, damage: impl IntoIterator<Item = Rectangle<N, Kind>>) {
-        // FIXME: Get rid of this allocation here
-        let mut damage = damage.into_iter().filter(|d| !d.is_empty()).collect::<Vec<_>>();
+        let mut damage: smallvec::SmallVec<[Rectangle<N, Kind>; MAX_DAMAGE_RECTS]> =
+            damage.into_iter().filter(|d| !d.is_empty()).collect();
 
         if damage.is_empty() {
-            // do not track empty damage
             return;
         }
 
         damage.dedup();
 
         let inner_damage = Arc::make_mut(&mut self.damage);
-        inner_damage.push_front(smallvec::SmallVec::from_vec(damage));
+        inner_damage.push_front(damage);
         inner_damage.truncate(self.limit);
 
         self.commit_counter.increment();
