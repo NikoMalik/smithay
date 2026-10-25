@@ -5,6 +5,7 @@
 
 use core::slice;
 use glam::{Affine2, Mat3, Vec2};
+use parking_lot::{Mutex, RwLock, RwLockWriteGuard};
 use std::{
     collections::HashMap,
     ffi::{CStr, CString},
@@ -15,11 +16,12 @@ use std::{
     ptr,
     rc::Rc,
     sync::{
-        Arc, Mutex, RwLock, RwLockWriteGuard, TryLockError,
+        Arc, TryLockError,
         atomic::{AtomicBool, AtomicPtr, Ordering},
         mpsc::{self, Sender},
     },
 };
+
 use tracing::{Level, debug, error, info, info_span, instrument, span, span::EnteredSpan, trace, warn};
 
 pub mod element;
@@ -177,7 +179,6 @@ enum GlesTargetInternal<'a> {
         texture: GlesTexture,
         sync_lock: RwLockWriteGuard<'a, TextureSync>,
         fbo: ffi::types::GLuint,
-        destruction_callback_sender: Sender<CleanupResource>,
     },
     Renderbuffer {
         buf: &'a mut GlesRenderbuffer,
@@ -264,13 +265,6 @@ impl GlesTargetInternal<'_> {
 impl Drop for GlesTargetInternal<'_> {
     fn drop(&mut self) {
         match self {
-            GlesTargetInternal::Texture {
-                fbo,
-                destruction_callback_sender,
-                ..
-            } => {
-                let _ = destruction_callback_sender.send(CleanupResource::FramebufferObject(*fbo));
-            }
             GlesTargetInternal::Renderbuffer { buf, fbo, .. } => {
                 let _ = buf
                     .0
@@ -326,16 +320,12 @@ impl Default for GlesCleanup {
 impl GlesCleanup {
     fn cleanup(&self, egl: &EGLContext, gl: &ffi::Gles2) -> Result<(), MakeCurrentError> {
         let receiver = match self.receiver.try_lock() {
-            Ok(receiver) => receiver,
-            Err(TryLockError::Poisoned(err)) => {
-                self.receiver.clear_poison();
-                err.into_inner()
-            }
-            Err(TryLockError::WouldBlock) => {
-                // Another thread is running `cleanup`, so just return
+            Some(receiver) => receiver,
+            None => {
                 return Ok(());
             }
         };
+
         let Ok(first) = receiver.try_recv() else {
             return Ok(());
         };
@@ -407,6 +397,9 @@ pub struct GlesRenderer {
     // caches
     buffers: Vec<GlesBuffer>,
     dmabuf_cache: HashMap<WeakDmabuf, GlesTexture>,
+    // one framebuffer per texture bound as a target, kept while the texture lives: a new one
+    // every frame (screencast buffers, outputs) grew the NVIDIA driver's memory without end
+    texture_fbos: HashMap<ffi::types::GLuint, (std::sync::Weak<GlesTextureInternal>, ffi::types::GLuint)>,
     vbos: [ffi::types::GLuint; 2],
     vertices: Vec<f32>,
     non_opaque_damage: Vec<Rectangle<i32, Physical>>,
@@ -748,6 +741,7 @@ impl GlesRenderer {
 
             buffers: Vec::new(),
             dmabuf_cache: std::collections::HashMap::new(),
+            texture_fbos: std::collections::HashMap::new(),
             vertices: Vec::with_capacity(6 * 16),
             non_opaque_damage: Vec::with_capacity(16),
             opaque_damage: Vec::with_capacity(16),
@@ -768,9 +762,24 @@ impl GlesRenderer {
             self.egl.make_current()?;
         }
 
+        let cached = self
+            .texture_fbos
+            .get(&texture.0.texture)
+            .filter(|(weak, _)| weak.strong_count() > 0 && weak.as_ptr() == Arc::as_ptr(&texture.0))
+            .map(|(_, fbo)| *fbo);
+
         let bind = || {
-            let mut sync_lock = texture.0.sync.write().unwrap();
+            let mut sync_lock = texture.0.sync.write();
             let mut fbo = 0;
+
+            if let Some(fbo) = cached {
+                sync_lock.wait_for_all(&self.gl);
+                return Ok(GlesTarget(GlesTargetInternal::Texture {
+                    texture: texture.clone(),
+                    sync_lock,
+                    fbo,
+                }));
+            }
             unsafe {
                 sync_lock.wait_for_all(&self.gl);
                 self.gl.GenFramebuffers(1, &mut fbo as *mut _);
@@ -810,18 +819,30 @@ impl GlesRenderer {
             Ok(GlesTarget(GlesTargetInternal::Texture {
                 texture: texture.clone(),
                 sync_lock,
-                destruction_callback_sender: self.gles_cleanup().sender.clone(),
                 fbo,
             }))
         };
-
-        bind().inspect_err(|_| {
-            if let Err(err) = self.unbind() {
-                self.span.in_scope(|| warn!(?err, "Failed to unbind on err"));
+        let res = bind();
+        match &res {
+            Ok(GlesTarget(GlesTargetInternal::Texture { fbo, .. })) if cached.is_none() => {
+                let entry = (Arc::downgrade(&texture.0), *fbo);
+                if let Some((_, stale)) = self.texture_fbos.insert(texture.0.texture, entry) {
+                    // the name of a texture gone before cleanup ran
+                    let _ = self
+                        .gles_cleanup()
+                        .sender
+                        .send(CleanupResource::FramebufferObject(stale));
+                }
             }
-        })
+            Ok(_) => {}
+            Err(_) => {
+                if let Err(err) = self.unbind() {
+                    self.span.in_scope(|| warn!(?err, "Failed to unbind on err"));
+                }
+            }
+        }
+        res
     }
-
     #[profiling::function]
     fn unbind(&mut self) -> Result<(), GlesError> {
         unsafe {
@@ -841,6 +862,14 @@ impl GlesRenderer {
     fn cleanup(&mut self) -> Result<(), GlesError> {
         self.dmabuf_cache.retain(|entry, _tex| !entry.is_gone());
         self.buffers.retain(|buffer| !buffer.0.dmabuf.is_gone());
+        let sender = self.gles_cleanup().sender.clone();
+        self.texture_fbos.retain(|_, (weak, fbo)| {
+            let alive = weak.strong_count() > 0;
+            if !alive {
+                let _ = sender.send(CleanupResource::FramebufferObject(*fbo));
+            }
+            alive
+        });
         self.gles_cleanup().cleanup(&self.egl, &self.gl)?;
         Ok(())
     }
@@ -889,7 +918,6 @@ impl ImportMemWl for GlesRenderer {
                 .data_map
                 .get_or_insert_threadsafe(|| Arc::new(Mutex::new(CacheMap::new())))
                 .lock()
-                .unwrap()
         });
 
         with_buffer_contents(buffer, |ptr, len, data| {
@@ -961,7 +989,7 @@ impl ImportMemWl for GlesRenderer {
                     }),
             );
 
-            let mut sync_lock = texture.0.sync.write().unwrap();
+            let mut sync_lock = texture.0.sync.write();
             unsafe {
                 sync_lock.wait_for_all(&self.gl);
                 self.gl.BindTexture(ffi::TEXTURE_2D, texture.0.texture);
@@ -1105,7 +1133,7 @@ impl ImportMem for GlesRenderer {
 
             let mut sync = RwLock::<TextureSync>::default();
             if self.capabilities.contains(&Capability::Fencing) {
-                sync.get_mut().unwrap().update_write(&self.gl);
+                sync.get_mut().update_write(&self.gl);
             } else if self.egl.is_shared() {
                 unsafe {
                     self.gl.Finish();
@@ -1153,7 +1181,7 @@ impl ImportMem for GlesRenderer {
             return Err(GlesError::UnexpectedSize);
         }
 
-        let mut sync_lock = texture.0.sync.write().unwrap();
+        let mut sync_lock = texture.0.sync.write();
         unsafe {
             self.egl.make_current()?;
             sync_lock.wait_for_all(&self.gl);
@@ -2976,7 +3004,7 @@ impl GlesFrame<'_, '_> {
 
         // render
         let gl = &self.renderer.gl;
-        let sync_lock = tex.0.sync.read().unwrap();
+        let sync_lock = tex.0.sync.read();
         unsafe {
             sync_lock.wait_for_upload(gl);
             let scope = self
