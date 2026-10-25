@@ -85,12 +85,12 @@ unsafe fn wait_for_syncpoint(sync: &mut Option<ffi::types::GLsync>, gl: &Gles2) 
 impl TextureSync {
     pub(super) fn wait_for_upload(&self, gl: &Gles2) {
         unsafe {
-            wait_for_syncpoint(&mut self.write_sync.lock(), gl);
+            wait_for_syncpoint(&mut self.write_sync.lock().unwrap(), gl);
         }
     }
 
     pub(super) fn update_read(&self, gl: &Gles2) {
-        let mut read_sync = self.read_sync.lock();
+        let mut read_sync = self.read_sync.lock().unwrap();
         if let Some(old) = read_sync.take() {
             unsafe {
                 gl.WaitSync(old, 0, ffi::TIMEOUT_IGNORED);
@@ -102,13 +102,13 @@ impl TextureSync {
 
     pub(super) fn wait_for_all(&mut self, gl: &Gles2) {
         unsafe {
-            wait_for_syncpoint(self.read_sync.get_mut(), gl);
-            wait_for_syncpoint(self.write_sync.get_mut(), gl);
+            wait_for_syncpoint(self.read_sync.get_mut().unwrap(), gl);
+            wait_for_syncpoint(self.write_sync.get_mut().unwrap(), gl);
         }
     }
 
     pub(super) fn update_write(&mut self, gl: &Gles2) {
-        let write_sync = self.write_sync.get_mut();
+        let write_sync = self.write_sync.get_mut().unwrap();
         if let Some(old) = write_sync.take() {
             unsafe {
                 gl.WaitSync(old, 0, ffi::TIMEOUT_IGNORED);
@@ -140,13 +140,13 @@ impl Drop for GlesTextureInternal {
         let _ = self
             .destruction_callback_sender
             .send(CleanupResource::Texture(self.texture));
-        let mut sync = self.sync.write();
-        if let Some(sync) = sync.read_sync.get_mut().take() {
+        let mut sync = self.sync.write().unwrap();
+        if let Some(sync) = sync.read_sync.get_mut().unwrap().take() {
             let _ = self
                 .destruction_callback_sender
                 .send(CleanupResource::Sync(sync as *const _));
         }
-        if let Some(sync) = sync.write_sync.get_mut().take() {
+        if let Some(sync) = sync.write_sync.get_mut().unwrap().take() {
             let _ = self
                 .destruction_callback_sender
                 .send(CleanupResource::Sync(sync as *const _));
