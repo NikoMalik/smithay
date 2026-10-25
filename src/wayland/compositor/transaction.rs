@@ -291,52 +291,61 @@ impl TransactionQueue {
     }
 
     pub(crate) fn take_ready(&mut self) -> Vec<Transaction> {
-        let Self {
-            transactions,
-            seen_surfaces,
-        } = self;
-
-        seen_surfaces.clear();
-
-        let mut ready = Vec::new();
-        let mut keep = Vec::with_capacity(transactions.len());
-
-        for t in transactions.drain(..) {
-            match t.state() {
-                // just drop
-                BlockerState::Cancelled => {}
-                // there is pendings: keep and keep alive own surcaces
-                BlockerState::Pending => {
-                    for (s, _) in &t.surfaces {
-                        if s.is_alive() {
-                            seen_surfaces.insert(s.id().protocol_id());
-                        }
-                    }
-                    keep.push(t);
+        // FIXME: Get rid of this allocation here
+        let mut ready_transactions = Vec::new();
+        // this is a very non-optimized implementation
+        // we just iterate over the queue of transactions, keeping track of which
+        // surface we have seen as they encode transaction dependencies
+        self.seen_surfaces.clear();
+        // manually iterate as we're going to modify the Vec while iterating on it
+        let mut i = 0;
+        // the loop will terminate, as at every iteration either i is incremented by 1
+        // or the length of self.transactions is reduced by 1.
+        while i < self.transactions.len() {
+            let mut skip = false;
+            // does the transaction have any active blocker?
+            match self.transactions[i].state() {
+                BlockerState::Cancelled => {
+                    // this transaction is cancelled, remove it without further processing
+                    self.transactions.remove(i);
+                    continue;
                 }
-
-                // Blockers not: check dependency on previos transactions
-                BlockerState::Released => {
-                    let blocked = t
-                        .surfaces
-                        .iter()
-                        .any(|(s, _)| s.is_alive() && seen_surfaces.contains(&s.id().protocol_id()));
-
-                    if blocked {
-                        for (s, _) in &t.surfaces {
-                            if s.is_alive() {
-                                seen_surfaces.insert(s.id().protocol_id());
-                            }
-                        }
-                        keep.push(t);
-                    } else {
-                        ready.push(t);
+                BlockerState::Pending => {
+                    skip = true;
+                }
+                BlockerState::Released => {}
+            }
+            // if not, does this transaction depend on any previous transaction?
+            if !skip {
+                for (s, _) in &self.transactions[i].surfaces {
+                    // TODO: is this alive check still needed?
+                    if !s.is_alive() {
+                        continue;
+                    }
+                    if self.seen_surfaces.contains(&s.id().protocol_id()) {
+                        skip = true;
+                        break;
                     }
                 }
             }
+
+            if skip {
+                // this transaction is not yet ready and should be skipped, add its surfaces to our
+                // seen list
+                for (s, _) in &self.transactions[i].surfaces {
+                    // TODO: is this alive check still needed?
+                    if !s.is_alive() {
+                        continue;
+                    }
+                    self.seen_surfaces.insert(s.id().protocol_id());
+                }
+                i += 1;
+            } else {
+                // this transaction is to be applied, yay!
+                ready_transactions.push(self.transactions.remove(i));
+            }
         }
 
-        transactions.extend(keep);
-        ready
+        ready_transactions
     }
 }
