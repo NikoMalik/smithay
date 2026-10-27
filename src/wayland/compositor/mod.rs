@@ -127,6 +127,7 @@ pub use crate::utils::hook::HookId;
 use crate::utils::{Buffer, Logical, Point, Rectangle, user_data::UserDataMap};
 use crate::wayland::GlobalData;
 use portable_atomic::AtomicF64;
+use smallvec::SmallVec;
 use wayland_server::backend::GlobalId;
 use wayland_server::protocol::wl_compositor::WlCompositor;
 use wayland_server::protocol::wl_subcompositor::WlSubcompositor;
@@ -642,7 +643,7 @@ impl CompositorClientState {
         let transactions = if let Some(queue) = self.queue.lock().unwrap().as_mut() {
             queue.take_ready()
         } else {
-            Vec::new()
+            SmallVec::new()
         };
 
         for transaction in transactions {
