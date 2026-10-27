@@ -185,7 +185,7 @@ impl PrivateSurfaceData {
         f(&guard.public_data)
     }
 
-    pub fn add_blocker(surface: &WlSurface, blocker: impl Blocker + Send + 'static) {
+    pub fn add_blocker(surface: &WlSurface, blocker: impl Blocker + Send + Sync + 'static) {
         Self::lock_user_data(surface)
             .pending_transaction
             .add_blocker(blocker)
@@ -324,12 +324,16 @@ impl PrivateSurfaceData {
             // release the mutex, as applying the transaction will try to lock it
             std::mem::drop(my_data);
             // trigger the queue
-            let transactions = queue.take_ready();
+            let (transactions, notifications) = queue.take_ready();
             // release the queue lock
             std::mem::drop(queue_guard);
             // apply might call commit, which might call blocker_cleared, so we need to free the queue before applying
             for transaction in transactions {
                 transaction.apply(dh, state)
+            }
+            // notify delayed blockers, they might call blocker_cleared as well
+            for notification in notifications {
+                notification.deliver();
             }
         }
     }
