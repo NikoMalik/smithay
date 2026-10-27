@@ -45,7 +45,7 @@ use smithay::{
         input::InputEvent,
         libinput::{LibinputInputBackend, LibinputSessionInterface},
         renderer::{
-            DebugFlags, ImportDma, ImportMemWl,
+            DebugFlags, ImportDma, ImportMemWl, PresentationMode,
             damage::Error as OutputDamageTrackerError,
             element::{AsRenderElements, RenderElementStates, memory::MemoryRenderBuffer},
             gles::{Capability, GlesRenderer},
@@ -651,6 +651,7 @@ struct SurfaceData {
     dmabuf_feedback: Option<SurfaceDmabufFeedback>,
     last_presentation_time: Option<Time<Monotonic>>,
     vblank_throttle_timer: Option<RegistrationToken>,
+    force_tearing: bool,
 }
 
 impl Drop for SurfaceData {
@@ -726,7 +727,28 @@ fn get_surface_dmabuf_feedback(
         .formats
         .iter()
         .copied()
-        .chain(planes.overlay.into_iter().flat_map(|p| p.formats))
+        .chain(planes.overlay.iter().flat_map(|p| p.formats.iter().copied()))
+        .collect::<FormatSet>()
+        .intersection(&all_render_formats)
+        .copied()
+        .collect::<FormatSet>();
+
+    // We limit the scan-out tranche to formats we can also render from
+    // so that there is always a fallback render path available in case
+    // the supplied buffer can not be scanned out directly
+    let async_planes_formats = surface
+        .plane_info()
+        .formats_async
+        .as_ref()
+        .unwrap_or(&surface.plane_info().formats)
+        .iter()
+        .copied()
+        .chain(
+            planes
+                .overlay
+                .into_iter()
+                .flat_map(|p| p.formats_async.unwrap_or(FormatSet::default())),
+        )
         .collect::<FormatSet>()
         .intersection(&all_render_formats)
         .copied()
@@ -749,10 +771,27 @@ fn get_surface_dmabuf_feedback(
     };
 
     let scanout_feedback = builder
+        .clone()
         .add_preference_tranche(
             surface.device_fd().dev_id().unwrap(),
             zwp_linux_dmabuf_feedback_v1::TrancheFlags::Scanout,
             planes_formats,
+            4u32..=6,
+        )
+        .add_preference_tranche(
+            scanout_node.dev_id(),
+            zwp_linux_dmabuf_feedback_v1::TrancheFlags::Sampling,
+            render_formats.clone(),
+            4u32..=6,
+        )
+        .build()
+        .unwrap();
+
+    let async_feedback = builder
+        .add_preference_tranche(
+            surface.device_fd().dev_id().unwrap(),
+            zwp_linux_dmabuf_feedback_v1::TrancheFlags::Scanout,
+            async_planes_formats,
             4u32..=6,
         )
         .add_preference_tranche(
@@ -767,6 +806,7 @@ fn get_surface_dmabuf_feedback(
     Some(SurfaceDmabufFeedback {
         render_feedback,
         scanout_feedback,
+        async_feedback,
     })
 }
 
@@ -1057,6 +1097,7 @@ impl AnvilState<UdevData> {
                 )
             });
 
+            let force_tearing = std::env::var("ANVIL_FORCE_TEARING").is_ok();
             let surface = SurfaceData {
                 dh: self.display_handle.clone(),
                 device_id: node,
@@ -1072,6 +1113,7 @@ impl AnvilState<UdevData> {
                 dmabuf_feedback,
                 last_presentation_time: None,
                 vblank_throttle_timer: None,
+                force_tearing,
             };
 
             device.surfaces.insert(crtc, surface);
@@ -1263,8 +1305,14 @@ impl AnvilState<UdevData> {
             frame_duration.saturating_sub(Time::elapsed(&last_presentation_time, clock))
         });
 
+        let presentation_mode = surface
+            .drm_output
+            .with_pending_frame(|frame| frame.map(|frame| frame.presentation_mode));
+
         if let Some(vblank_remaining_time) = vblank_remaining_time {
-            if vblank_remaining_time > frame_duration / 2 {
+            if presentation_mode != Some(PresentationMode::Async)
+                && vblank_remaining_time > frame_duration / 2
+            {
                 static WARN_ONCE: Once = Once::new();
                 WARN_ONCE.call_once(|| {
                     warn!("display running faster than expected, throttling vblanks and disabling HwClock")
@@ -1296,7 +1344,7 @@ impl AnvilState<UdevData> {
 
         let schedule_render = match submit_result {
             Ok(user_data) => {
-                if let Some(mut feedback) = user_data.flatten() {
+                if let Some(mut feedback) = user_data {
                     feedback.presented(clock, Refresh::fixed(frame_duration), seq as u64, flags);
                 }
 
@@ -1649,19 +1697,28 @@ fn render_surface<'a>(
     let (elements, clear_color) =
         output_elements(output, space, custom_elements, renderer, show_window_preview);
 
+    let presentation_mode = if surface.force_tearing {
+        PresentationMode::Async
+    } else {
+        PresentationMode::VSync
+    };
+
     let frame_mode = if surface.disable_direct_scanout {
         FrameFlags::empty()
+    } else if presentation_mode == PresentationMode::Async {
+        FrameFlags::DEFAULT | FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY
     } else {
         FrameFlags::DEFAULT
     };
     let (rendered, states) = surface
         .drm_output
-        .render_frame(renderer, &elements, clear_color, frame_mode)
+        .render_frame(renderer, &elements, clear_color, frame_mode, presentation_mode)
         .map(|render_frame_result| {
             #[cfg(feature = "renderer_sync")]
             if let PrimaryPlaneElement::Swapchain(element) = render_frame_result.primary_element {
                 element.sync.wait();
             }
+
             (!render_frame_result.is_empty, render_frame_result.states)
         })
         .map_err(|err| match err {

@@ -63,6 +63,7 @@
 //!         exporter::gbm::GbmFramebufferExporter,
 //!         DrmSurface,
 //!     },
+//!     backend::renderer::PresentationMode,
 //!     output::{Output, PhysicalProperties, Subpixel},
 //!     utils::Size,
 //! };
@@ -109,7 +110,7 @@
 //!
 //! # let elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = Vec::new();
 //! let render_frame_result = compositor
-//!     .render_frame::<_, _>(&mut renderer, &elements, CLEAR_COLOR, FrameFlags::DEFAULT)
+//!     .render_frame::<_, _>(&mut renderer, &elements, CLEAR_COLOR, FrameFlags::DEFAULT, PresentationMode::VSync)
 //!     .expect("failed to render frame");
 //!
 //! if !render_frame_result.is_empty {
@@ -135,7 +136,7 @@ use std::{
 
 use drm::{
     Device, DriverCapability,
-    control::{Device as _, Mode, PlaneType, connector, crtc, framebuffer, plane},
+    control::{Device as _, Mode, PageFlipFlags, PlaneType, connector, crtc, framebuffer, plane},
 };
 use drm_fourcc::{DrmFormat, DrmFourcc, DrmModifier};
 use indexmap::{IndexMap, IndexSet};
@@ -159,7 +160,8 @@ use crate::{
         },
         drm::{DrmError, PlaneDamageClips, plane_has_property},
         renderer::{
-            Bind, Color32F, DebugFlags, Renderer, RendererSuper, Texture, buffer_y_inverted,
+            Bind, Color32F, DebugFlags, PresentationMode, Renderer, RendererSuper, Texture,
+            buffer_y_inverted,
             damage::{Error as OutputDamageTrackerError, OutputDamageTracker},
             element::{
                 Element, Id, Kind, RenderElement, RenderElementPresentationState, RenderElementState,
@@ -192,6 +194,14 @@ impl RenderElementState {
         RenderElementState {
             visible_area,
             presentation_state: RenderElementPresentationState::ZeroCopy,
+            needs_capture: false,
+        }
+    }
+
+    pub(crate) fn zero_copy_async(visible_area: usize) -> Self {
+        RenderElementState {
+            visible_area,
+            presentation_state: RenderElementPresentationState::Async,
             needs_capture: false,
         }
     }
@@ -568,6 +578,7 @@ impl<B: Buffer, F: Framebuffer> Clone for PlaneState<B, F> {
 #[derive(Debug)]
 struct FrameState<B: Buffer, F: Framebuffer> {
     planes: SmallVec<[(plane::Handle, PlaneState<B, F>); 10]>,
+    async_flip_failed: bool,
 }
 
 impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
@@ -644,39 +655,23 @@ impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
                 .map(|info| (info.handle, PlaneState::default())),
         );
 
-        FrameState { planes: tmp }
-    }
-}
-impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
-    /// the primary plane's new framebuffer (and what to wait for before showing
-    /// it) when nothing else changed since `previous`: all an async page flip may change.
-    fn async_flip(
-        &self,
-        previous: &Self,
-        primary: plane::Handle,
-    ) -> Option<(framebuffer::Handle, Option<SyncPoint>)> {
-        let mut flip = None;
-        for (handle, state) in &self.planes {
-            if *handle != primary {
-                if !state.skip {
-                    return None;
-                }
-                continue;
-            }
-            let config = state.config.as_ref().filter(|_| !state.skip)?;
-            let before = previous.plane_state(primary)?.config.as_ref()?;
-            if !config.is_compatible(before) {
-                return None;
-            }
-            flip = Some((
-                *config.buffer.as_ref(),
-                config.sync.as_ref().map(|(sync, _)| sync.clone()),
-            ));
+        FrameState {
+            planes: tmp,
+            async_flip_failed: false,
         }
-        flip
     }
 }
+
 impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
+    fn is_fully_compatible(&self, previous_frame: &Self) -> bool {
+        self.planes.iter().all(|(handle, state)| {
+            previous_frame
+                .plane_state(*handle)
+                .map(|other| state.is_compatible(other))
+                .unwrap_or(false)
+        })
+    }
+
     #[profiling::function]
     #[inline]
     fn set_state(&mut self, plane: plane::Handle, state: PlaneState<B, F>) {
@@ -695,6 +690,7 @@ impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
         plane: plane::Handle,
         state: PlaneState<B, F>,
         allow_modeset: bool,
+        presentation_mode: PresentationMode,
     ) -> Result<(), DrmError> {
         let current_config = match self.plane_state_mut(plane) {
             Some(config) => config,
@@ -703,7 +699,11 @@ impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
         let backup = current_config.clone();
         *current_config = state;
 
-        let res = surface.test_state(self.build_planes(surface, supports_fencing, true), allow_modeset);
+        let res = surface.test_state(
+            self.build_planes(surface, supports_fencing, true),
+            allow_modeset,
+            presentation_mode == PresentationMode::Async,
+        );
 
         if res.is_err() {
             // test failed, restore previous state
@@ -725,14 +725,10 @@ impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
         supports_fencing: bool,
         allow_modeset: bool,
         allow_partial_update: bool,
+        presentation_mode: PresentationMode,
     ) -> Result<(), DrmError> {
         let needs_test = self.planes.iter().any(|(_, state)| state.needs_test);
-        let is_fully_compatible = self.planes.iter().all(|(handle, state)| {
-            previous_frame
-                .plane_state(*handle)
-                .map(|other| state.is_compatible(other))
-                .unwrap_or(false)
-        });
+        let is_fully_compatible = self.is_fully_compatible(previous_frame);
 
         if allow_partial_update && (!needs_test || is_fully_compatible) {
             trace!("skipping fully compatible state test");
@@ -745,6 +741,7 @@ impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
         let res = surface.test_state(
             self.build_planes(surface, supports_fencing, allow_partial_update),
             allow_modeset,
+            presentation_mode == PresentationMode::Async,
         );
 
         if res.is_ok() {
@@ -762,12 +759,11 @@ impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
         surface: &DrmSurface,
         supports_fencing: bool,
         allow_partial_update: bool,
-        event: bool,
     ) -> Result<(), crate::backend::drm::error::Error> {
         debug_assert!(!self.planes.iter().any(|(_, state)| state.needs_test));
         surface.commit(
             self.build_planes(surface, supports_fencing, allow_partial_update),
-            event,
+            PageFlipFlags::EVENT,
         )
     }
 
@@ -777,12 +773,12 @@ impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
         surface: &DrmSurface,
         supports_fencing: bool,
         allow_partial_update: bool,
-        event: bool,
+        flip_flags: PageFlipFlags,
     ) -> Result<(), crate::backend::drm::error::Error> {
         debug_assert!(!self.planes.iter().any(|(_, state)| state.needs_test));
         surface.page_flip(
             self.build_planes(surface, supports_fencing, allow_partial_update),
-            event,
+            flip_flags,
         )
     }
 
@@ -972,6 +968,7 @@ impl From<&PlaneInfo> for PlaneAssignment {
 struct PendingFrame<A: Allocator, F: ExportFramebuffer<<A as Allocator>::Buffer>, U> {
     frame: CompositorFrameState<A, F>,
     user_data: U,
+    presentation_mode: PresentationMode,
 }
 
 impl<A, F, U> std::fmt::Debug for PendingFrame<A, F, U>
@@ -1020,6 +1017,7 @@ enum PreparedFrameKind {
 struct PreparedFrame<A: Allocator, F: ExportFramebuffer<<A as Allocator>::Buffer>> {
     frame: CompositorFrameState<A, F>,
     kind: PreparedFrameKind,
+    presentation_mode: PresentationMode,
 }
 
 impl<A: Allocator, F: ExportFramebuffer<<A as Allocator>::Buffer>> PreparedFrame<A, F> {
@@ -1069,6 +1067,16 @@ bitflags::bitflags! {
     }
 }
 
+/// A reference to a frame
+#[derive(Debug)]
+pub struct FrameRef<'a, U> {
+    /// User-data of the frame
+    pub user_data: &'a U,
+
+    /// Presentation mode of this frame
+    pub presentation_mode: PresentationMode,
+}
+
 /// Composite an output using a combination of planes and rendering
 ///
 /// see the [`module docs`](crate::backend::drm::compositor) for more information
@@ -1091,9 +1099,7 @@ where
     supports_fencing: bool,
     reset_pending: bool,
     signaled_fence: Option<Arc<OwnedFd>>,
-    allow_tearing: bool,
-    async_flip_failed: bool,
-    async_flip_seen: bool,
+
     framebuffer_exporter: F,
 
     current_frame: CompositorFrameState<A, F>,
@@ -1278,9 +1284,6 @@ where
                         primary_plane_damage_bag: DamageBag::new(4),
                         primary_is_opaque: is_opaque,
                         reset_pending: true,
-                        allow_tearing: false,
-                        async_flip_failed: false,
-                        async_flip_seen: false,
                         signaled_fence,
                         current_frame,
                         pending_frame: None,
@@ -1463,9 +1466,6 @@ where
             primary_plane_damage_bag: DamageBag::new(4),
             primary_is_opaque: is_opaque,
             reset_pending: true,
-            allow_tearing: false,
-            async_flip_failed: false,
-            async_flip_seen: false,
             signaled_fence,
             current_frame,
             pending_frame: None,
@@ -1608,7 +1608,14 @@ where
             }),
         };
 
-        match current_frame_state.test_state(drm, supports_fencing, drm.plane(), plane_state, true) {
+        match current_frame_state.test_state(
+            drm,
+            supports_fencing,
+            drm.plane(),
+            plane_state,
+            true,
+            PresentationMode::VSync,
+        ) {
             Ok(_) => Ok((swapchain, use_opaque)),
             Err(err) => {
                 warn!(
@@ -1725,6 +1732,7 @@ where
         elements: &'a [E],
         clear_color: impl Into<Color32F>,
         frame_flags: FrameFlags,
+        presentation_mode: PresentationMode,
     ) -> Result<RenderFrameResult<'a, A::Buffer, F::Framebuffer, E>, RenderFrameErrorType<A, F, R>>
     where
         E: RenderElement<R>,
@@ -2062,6 +2070,7 @@ where
                 output_geometry,
                 try_assign_primary_plane,
                 frame_flags,
+                presentation_mode,
             ) {
                 Ok(direct_scan_out_plane) => {
                     match direct_scan_out_plane.type_ {
@@ -2073,8 +2082,17 @@ where
                     }
 
                     if let Some(state) = render_element_states.states.get_mut(element_id) {
-                        state.presentation_state = RenderElementPresentationState::ZeroCopy;
+                        state.presentation_state = if presentation_mode == PresentationMode::Async {
+                            RenderElementPresentationState::Async
+                        } else {
+                            RenderElementPresentationState::ZeroCopy
+                        };
                         state.visible_area += element_visible_area;
+                    } else if presentation_mode == PresentationMode::Async {
+                        render_element_states.states.insert(
+                            element_id.clone(),
+                            RenderElementState::zero_copy_async(*element_visible_area),
+                        );
                     } else {
                         render_element_states.states.insert(
                             element_id.clone(),
@@ -2123,6 +2141,7 @@ where
                 self.supports_fencing,
                 false,
                 allow_partial_update,
+                presentation_mode,
             )
             .is_err()
         {
@@ -2429,6 +2448,48 @@ where
             }
         }
 
+        // In case we want to do an async page flip make sure
+        // that we at least now that it won't fail.
+        let presentation_mode = if presentation_mode == PresentationMode::Async
+            && next_frame_state.is_fully_compatible(previous_state)
+        {
+            let async_page_flip_might_supported =
+                next_frame_state.planes.iter().all(|(plane_handle, state)| {
+                    let Some(buffer) = state.buffer() else {
+                        return true;
+                    };
+
+                    let Some(plane_info) = self
+                        .planes
+                        .primary
+                        .iter()
+                        .find(|plane| plane.handle == *plane_handle)
+                        .or_else(|| {
+                            self.planes
+                                .overlay
+                                .iter()
+                                .find(|plane| plane.handle == *plane_handle)
+                        })
+                    else {
+                        return false;
+                    };
+
+                    let Some(async_formats) = plane_info.formats_async.as_ref() else {
+                        return true;
+                    };
+
+                    async_formats.contains(&buffer.format())
+                });
+
+            if async_page_flip_might_supported {
+                presentation_mode
+            } else {
+                PresentationMode::VSync
+            }
+        } else {
+            PresentationMode::VSync
+        };
+
         let next_frame = PreparedFrame {
             kind: if allow_partial_update {
                 PreparedFrameKind::Partial
@@ -2436,6 +2497,7 @@ where
                 PreparedFrameKind::Full
             },
             frame: next_frame_state,
+            presentation_mode,
         };
         let frame_reference: RenderFrameResult<'a, A::Buffer, F::Framebuffer, E> = RenderFrameResult {
             is_empty: next_frame.is_empty(),
@@ -2545,7 +2607,8 @@ where
 
         let flip = prepared_frame
             .frame
-            .commit(&self.surface, self.supports_fencing, false, false);
+            .commit(&self.surface, self.supports_fencing, false)
+            .map(|_| PresentationMode::VSync);
 
         let res = self.handle_flip(&prepared_frame, flip);
 
@@ -2555,7 +2618,7 @@ where
             self.current_frame = prepared_frame.frame;
         }
 
-        res
+        res.map(|_| ())
     }
 
     /// Re-evaluates the current state of the crtc and forces calls to [`render_frame`](DrmCompositor::render_frame)
@@ -2574,63 +2637,88 @@ where
     }
 
     #[profiling::function]
-    fn submit(&mut self) -> FrameResult<(), A, F> {
+    fn submit(&mut self) -> FrameResult<PresentationMode, A, F> {
         let QueuedFrame {
             mut prepared_frame,
             user_data,
         } = self.queued_frame.take().unwrap();
 
         let allow_partial_update = prepared_frame.kind == PreparedFrameKind::Partial;
-        let async_flip = (self.allow_tearing
-            && !self.async_flip_failed
-            && !self.surface.is_legacy()
-            && !self.surface.commit_pending())
-        .then(|| {
-            prepared_frame
-                .frame
-                .async_flip(&self.current_frame, self.surface.plane())
-        })
-        .flatten();
         let flip = if self.surface.commit_pending() {
             prepared_frame
                 .frame
-                .commit(&self.surface, self.supports_fencing, allow_partial_update, true)
-        } else if let Some((fb, sync)) = async_flip {
-            // the async request carries no IN_FENCE_FD: wait for the buffer here
-            if let Some(Err(err)) = sync.map(|sync| sync.wait()) {
-                warn!("error waiting for an async flip's buffer: {err:?}");
+                .commit(&self.surface, self.supports_fencing, allow_partial_update)
+                .map(|_| PresentationMode::VSync)
+        } else {
+            let previous_state = self
+                .pending_frame
+                .as_ref()
+                .map(|f| &f.frame)
+                .unwrap_or(&self.current_frame);
+
+            let is_fully_compatible = prepared_frame.frame.is_fully_compatible(previous_state);
+
+            // If the properties of the plane did not change we can expect the async flip state to
+            // also stay unchanged. So in case it failed previously we can skip trying again.
+            if is_fully_compatible {
+                prepared_frame.frame.async_flip_failed = previous_state.async_flip_failed;
             }
-            match self.surface.page_flip_async(self.surface.plane(), fb, true) {
-                Ok(()) => {
-                    if !self.async_flip_seen {
-                        self.async_flip_seen = true;
-                        info!("async page flips (tearing) work on this output");
+
+            let mut flip_flags = PageFlipFlags::EVENT;
+
+            // As already noted async page flips are only allowed when only the primary plane
+            // changed in a compatible way. We also want to skip it in case we already tried
+            // and failed. An async page flip can for example also fail for certain modifiers,
+            // for example on intel compressed formats might not be allowed.
+            if prepared_frame.presentation_mode == PresentationMode::Async
+                && is_fully_compatible
+                && allow_partial_update
+                && !prepared_frame.frame.async_flip_failed
+            {
+                flip_flags |= PageFlipFlags::ASYNC;
+            }
+
+            let flip = prepared_frame
+                .frame
+                .page_flip(
+                    &self.surface,
+                    self.supports_fencing,
+                    allow_partial_update,
+                    flip_flags,
+                )
+                .map(|_| {
+                    if flip_flags.contains(PageFlipFlags::ASYNC) {
+                        PresentationMode::Async
+                    } else {
+                        PresentationMode::VSync
                     }
-                    Ok(())
-                }
-                Err(err) => {
-                    warn!("async page flip refused, tearing off until asked again: {err}");
-                    self.async_flip_failed = true;
-                    prepared_frame.frame.page_flip(
+                });
+
+            // If an async page flip fails we retry without async and note
+            // that it failed to not try again until the plane properties change.
+            if flip.is_err() && flip_flags.contains(PageFlipFlags::ASYNC) {
+                prepared_frame.frame.async_flip_failed = true;
+                prepared_frame
+                    .frame
+                    .page_flip(
                         &self.surface,
                         self.supports_fencing,
                         allow_partial_update,
-                        true,
+                        PageFlipFlags::EVENT,
                     )
-                }
+                    .map(|_| PresentationMode::VSync)
+            } else {
+                flip
             }
-        } else {
-            prepared_frame
-                .frame
-                .page_flip(&self.surface, self.supports_fencing, allow_partial_update, true)
         };
 
         let res = self.handle_flip(&prepared_frame, flip);
 
-        if res.is_ok() {
+        if let Ok(presentation_mode) = &res {
             self.pending_frame = Some(PendingFrame {
                 frame: prepared_frame.frame,
                 user_data,
+                presentation_mode: *presentation_mode,
             });
         }
 
@@ -2640,8 +2728,8 @@ where
     fn handle_flip(
         &mut self,
         prepared_frame: &PreparedFrame<A, F>,
-        flip: Result<(), crate::backend::drm::error::Error>,
-    ) -> FrameResult<(), A, F> {
+        flip: Result<PresentationMode, crate::backend::drm::error::Error>,
+    ) -> FrameResult<PresentationMode, A, F> {
         match flip {
             Ok(_) => {
                 if prepared_frame.kind == PreparedFrameKind::Full {
@@ -2679,22 +2767,42 @@ where
         flip.map_err(FrameError::DrmError)
     }
 
+    /// Access the currently pending frame without submitting it
+    pub fn pending_frame(&self) -> Option<FrameRef<'_, U>> {
+        self.pending_frame.as_ref().map(|frame| FrameRef {
+            user_data: &frame.user_data,
+            presentation_mode: frame.presentation_mode,
+        })
+    }
+
+    /// Access the currently queued frame
+    pub fn queued_frame(&self) -> Option<FrameRef<'_, U>> {
+        self.queued_frame.as_ref().map(|frame| FrameRef {
+            user_data: &frame.user_data,
+            presentation_mode: frame.prepared_frame.presentation_mode,
+        })
+    }
+
     /// Marks the current frame as submitted.
     ///
     /// *Note*: Needs to be called, after the vblank event of the matching [`DrmDevice`](super::DrmDevice)
     /// was received after calling [`DrmCompositor::queue_frame`] on this surface.
     /// Otherwise the underlying swapchain will run out of buffers eventually.
     #[profiling::function]
-    pub fn frame_submitted(&mut self) -> FrameResult<Option<U>, A, F> {
-        if let Some(PendingFrame { mut frame, user_data }) = self.pending_frame.take() {
-            std::mem::swap(&mut frame, &mut self.current_frame);
-            if self.queued_frame.is_some() {
-                self.submit()?;
-            }
-            Ok(Some(user_data))
-        } else {
-            Ok(None)
+    pub fn frame_submitted(&mut self) -> FrameResult<U, A, F> {
+        let Some(PendingFrame {
+            mut frame, user_data, ..
+        }) = self.pending_frame.take()
+        else {
+            return Err(FrameError::EmptyFrame);
+        };
+
+        std::mem::swap(&mut frame, &mut self.current_frame);
+        if self.queued_frame.is_some() {
+            self.submit()?;
         }
+
+        Ok(user_data)
     }
 
     /// Reset the underlying buffers
@@ -2806,18 +2914,6 @@ where
         self.surface.vrr_enabled()
     }
 
-    /// angel-smithay: allow async ("tearing") page flips: a frame that changes only the primary
-    /// plane's buffer is shown at once instead of at the next vblank. Atomic surfaces only; a
-    /// flip the kernel refuses falls back to a normal one, and async flips stay off until this
-    /// is set again.
-    pub fn set_allow_tearing(&mut self, allow: bool) {
-        if allow != self.allow_tearing {
-            self.async_flip_failed = false;
-            self.async_flip_seen = false;
-        }
-        self.allow_tearing = allow;
-    }
-
     /// Tries to set variable refresh rate (VRR) for the next frame.
     ///
     /// Doing so might cause the next frame to trigger a modeset.
@@ -2911,6 +3007,7 @@ where
         output_geometry: Rectangle<i32, Physical>,
         try_assign_primary_plane: bool,
         frame_flags: FrameFlags,
+        presentation_mode: PresentationMode,
     ) -> Result<PlaneAssignment, Option<RenderingReason>>
     where
         R: Renderer + Bind<Dmabuf>,
@@ -2942,6 +3039,7 @@ where
                 output_transform,
                 output_geometry,
                 frame_flags,
+                presentation_mode,
             ) {
                 Ok(plane) => {
                     trace!(
@@ -2965,6 +3063,7 @@ where
             output_transform,
             output_geometry,
             frame_flags,
+            presentation_mode,
         ) {
             trace!("assigned element {:?} to cursor {:?}", element.id(), plane.handle);
             return Ok(plane);
@@ -2983,6 +3082,7 @@ where
             output_transform,
             output_geometry,
             frame_flags,
+            presentation_mode,
         ) {
             Ok(plane) => {
                 trace!(
@@ -3013,6 +3113,7 @@ where
         output_transform: Transform,
         output_geometry: Rectangle<i32, Physical>,
         frame_flags: FrameFlags,
+        presentation_mode: PresentationMode,
     ) -> Result<PlaneAssignment, Option<RenderingReason>>
     where
         R: Renderer,
@@ -3080,7 +3181,14 @@ where
         }
 
         if element_config.failed_planes.primary {
-            return Err(Some(RenderingReason::ScanoutFailed));
+            // Note: This might not be completely correct, but it is easier than remembering
+            // why it failed. But it should not be wrong either, so...
+            let rendering_reason = if presentation_mode == PresentationMode::Async {
+                RenderingReason::AsyncScanoutFailed
+            } else {
+                RenderingReason::ScanoutFailed
+            };
+            return Err(Some(rendering_reason));
         }
 
         let res = self.try_assign_plane(
@@ -3089,9 +3197,10 @@ where
             self.surface.plane_info(),
             scale,
             frame_state,
+            presentation_mode,
         );
 
-        if let Err(Some(RenderingReason::ScanoutFailed)) = res {
+        if res.is_err() {
             element_config.failed_planes.primary = true;
         }
 
@@ -3112,6 +3221,7 @@ where
         output_transform: Transform,
         output_geometry: Rectangle<i32, Physical>,
         frame_flags: FrameFlags,
+        presentation_mode: PresentationMode,
     ) -> Option<PlaneAssignment>
     where
         R: Renderer,
@@ -3130,6 +3240,14 @@ where
         if element.kind() != Kind::Cursor {
             trace!(
                 "skipping element {:?} on cursor plane(s), element kind not cursor",
+                element.id(),
+            );
+            return None;
+        }
+
+        if presentation_mode == PresentationMode::Async {
+            trace!(
+                "skipping element {:?} on cursor plane(s), async presentation not supported",
                 element.id(),
             );
             return None;
@@ -3518,6 +3636,7 @@ where
                     plane_info.handle,
                     plane_state,
                     false,
+                    PresentationMode::VSync,
                 )
                 .is_ok()
         };
@@ -3802,6 +3921,7 @@ where
         output_transform: Transform,
         output_geometry: Rectangle<i32, Physical>,
         frame_flags: FrameFlags,
+        presentation_mode: PresentationMode,
     ) -> Result<PlaneAssignment, Option<RenderingReason>>
     where
         R: Renderer,
@@ -3949,7 +4069,14 @@ where
                 return Err(None);
             }
 
-            self.try_assign_plane(element, element_config, plane, scale, frame_state)
+            self.try_assign_plane(
+                element,
+                element_config,
+                plane,
+                scale,
+                frame_state,
+                presentation_mode,
+            )
         };
 
         // First try to assign the element to a compatible plane, this can save us
@@ -3973,7 +4100,12 @@ where
                     "skipping direct scan-out on {:?} with zpos {:?}, element {:?} geometry {:?}, test already known to fail",
                     plane.handle, plane.zpos, element_id, element_config.geometry,
                 );
-                rendering_reason = rendering_reason.or(Some(RenderingReason::ScanoutFailed));
+                rendering_reason =
+                    rendering_reason.or(Some(if presentation_mode == PresentationMode::Async {
+                        RenderingReason::AsyncScanoutFailed
+                    } else {
+                        RenderingReason::ScanoutFailed
+                    }));
                 continue;
             }
 
@@ -3981,7 +4113,10 @@ where
                 Ok(plane) => return Ok(plane),
                 Err(err) => {
                     // if the test failed save that in the tested element state
-                    if let Some(RenderingReason::ScanoutFailed) = err {
+                    if matches!(
+                        err,
+                        Some(RenderingReason::ScanoutFailed) | Some(RenderingReason::AsyncScanoutFailed)
+                    ) {
                         element_config.failed_planes.overlay_bitmask |= 1 << index;
                     }
 
@@ -4007,6 +4142,7 @@ where
         plane: &PlaneInfo,
         scale: Scale<f64>,
         frame_state: &mut CompositorFrameState<A, F>,
+        presentation_mode: PresentationMode,
     ) -> Result<PlaneAssignment, Option<RenderingReason>>
     where
         R: Renderer,
@@ -4028,7 +4164,31 @@ where
             element_id, plane.handle, plane.zpos, &element_config.buffer.fb, element_config.geometry
         );
 
-        if !plane.formats.contains(&element_config.properties.format) {
+        if presentation_mode == PresentationMode::Async {
+            // For async page flips we want to make sure to avoid unnecessary testing.
+            // If we know the supported formats we will make sure to only test if the
+            // buffer format is actually supported.
+            //
+            // If we don't know because the driver does not announce async formats we
+            // will take the slower path and test what actually works.
+            // At the time of writing only the intel driver supports the async formats.
+            let async_format_might_supported = plane
+                .formats_async
+                .as_ref()
+                .map(|formats| formats.contains(&element_config.properties.format))
+                .unwrap_or(true);
+
+            if !async_format_might_supported {
+                trace!(
+                    "skipping direct scan-out on {:?} with zpos {:?} for element {:?}, async format {:?} not supported",
+                    plane.handle,
+                    plane.zpos,
+                    element_id,
+                    element_config.properties.format,
+                );
+                return Err(Some(RenderingReason::AsyncFormatUnsupported));
+            }
+        } else if !plane.formats.contains(&element_config.properties.format) {
             trace!(
                 "skipping direct scan-out on {:?} with zpos {:?} for element {:?}, format {:?} not supported",
                 plane.handle, plane.zpos, element_id, element_config.properties.format,
@@ -4124,7 +4284,14 @@ where
             config: Some(config),
         };
 
-        let res = if is_compatible {
+        // In case we try to change the presentation mode we have to re-test
+        let presentation_mode_unchanged = self
+            .pending_frame
+            .as_ref()
+            .map(|frame| frame.presentation_mode == presentation_mode)
+            .unwrap_or(false);
+
+        let res = if is_compatible && presentation_mode_unchanged {
             trace!(
                 "skipping atomic test for compatible element {:?} on {:?} with zpos {:?}",
                 element_id, plane.handle, plane.zpos,
@@ -4132,6 +4299,26 @@ where
             frame_state.set_state(plane.handle, plane_state);
             true
         } else {
+            // Async page flips are a bit special as they are only allowed to
+            // change the fb_id, damage rects and fence. An async page flip will
+            // fail if we change anything else, including enabling the plane or
+            // changing the position.
+            //
+            // So how to we get the element on the plane if the plane support the format
+            // but we are not allowed to enable the plane?
+            // We will lie here and do a non async test to check if we can even put the
+            // element on the plane. This will make the async page flip fail, but might
+            // put the element on it and allow the next async flip to succeed.
+            // The next test will detect that the presentation mode has changed and the
+            // plane is compatible, in which case we will do an async test commit.
+            // If this fails we are out of luck and the element won't be put on a plane.
+            // The logic around failed planes should prevent a test cycle.
+            let presentation_mode_test = if is_compatible {
+                presentation_mode
+            } else {
+                PresentationMode::VSync
+            };
+
             frame_state
                 .test_state(
                     &self.surface,
@@ -4139,6 +4326,7 @@ where
                     plane.handle,
                     plane_state,
                     false,
+                    presentation_mode_test,
                 )
                 .is_ok()
         };
@@ -4156,7 +4344,11 @@ where
                 plane.handle, plane.zpos, element_id
             );
 
-            Err(Some(RenderingReason::ScanoutFailed))
+            if presentation_mode == PresentationMode::Async {
+                Err(Some(RenderingReason::AsyncScanoutFailed))
+            } else {
+                Err(Some(RenderingReason::ScanoutFailed))
+            }
         }
     }
 
