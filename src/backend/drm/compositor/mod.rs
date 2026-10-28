@@ -126,7 +126,6 @@
 //! }
 //! ```
 use std::{
-    collections::HashMap,
     fmt::Debug,
     io::ErrorKind,
     os::unix::io::{AsFd, OwnedFd},
@@ -139,7 +138,9 @@ use drm::{
     control::{Device as _, Mode, PageFlipFlags, PlaneType, connector, crtc, framebuffer, plane},
 };
 use drm_fourcc::{DrmFormat, DrmFourcc, DrmModifier};
-use indexmap::{IndexMap, IndexSet};
+use indexmap::IndexSet;
+
+use crate::utils::hash::{HashMap, IndexMap};
 use smallvec::SmallVec;
 use tracing::{debug, error, info, info_span, instrument, trace, warn};
 use wayland_server::{Resource, protocol::wl_buffer::WlBuffer};
@@ -1113,8 +1114,8 @@ where
     cursor_size: Size<i32, Physical>,
     cursor_state: Option<CursorState<G>>,
 
-    element_states: IndexMap<Id, ElementState<<F as ExportFramebuffer<A::Buffer>>::Framebuffer>>,
-    previous_element_states: IndexMap<Id, ElementState<<F as ExportFramebuffer<A::Buffer>>::Framebuffer>>,
+    element_states: HashMap<Id, ElementState<<F as ExportFramebuffer<A::Buffer>>::Framebuffer>>,
+    previous_element_states: HashMap<Id, ElementState<<F as ExportFramebuffer<A::Buffer>>::Framebuffer>>,
     opaque_regions: Vec<Rectangle<i32, Physical>>,
     element_opaque_regions_workhouse: Vec<Rectangle<i32, Physical>>,
 
@@ -1300,8 +1301,8 @@ where
                         output_mode_source,
                         planes,
                         overlay_plane_element_ids,
-                        element_states: IndexMap::new(),
-                        previous_element_states: IndexMap::new(),
+                        element_states: HashMap::default(),
+                        previous_element_states: HashMap::default(),
                         opaque_regions: Vec::new(),
                         element_opaque_regions_workhouse: Vec::new(),
                         supports_fencing,
@@ -1483,8 +1484,8 @@ where
             output_mode_source,
             planes,
             overlay_plane_element_ids,
-            element_states: IndexMap::new(),
-            previous_element_states: IndexMap::new(),
+            element_states: HashMap::default(),
+            previous_element_states: HashMap::default(),
             opaque_regions: Vec::new(),
             element_opaque_regions_workhouse: Vec::new(),
             supports_fencing,
@@ -1819,7 +1820,7 @@ where
         let mut element_states = std::mem::take(&mut self.element_states);
         element_states.reserve(std::cmp::min(elements.len(), self.planes.overlay.len()));
         let mut render_element_states = RenderElementStates {
-            states: HashMap::with_capacity(elements.len()),
+            states: crate::utils::hash::HashMap::with_capacity(elements.len()),
         };
 
         // So first we want to create a clean state, for that we have to reset all overlay and cursor planes
@@ -2020,7 +2021,7 @@ where
         // This will hold the element per plane that has been assigned to a overlay/underlay
         // plane for direct scan-out
         let mut overlay_plane_elements: IndexMap<plane::Handle, &'a E> =
-            IndexMap::with_capacity(self.planes.overlay.len());
+            IndexMap::with_capacity_and_hasher(self.planes.overlay.len(), Default::default());
         // This will hold the element assigned on the cursor plane if any
         let mut cursor_plane_element: Option<&'a E> = None;
 
@@ -3033,7 +3034,7 @@ where
         element_zindex: usize,
         element_geometry: Rectangle<i32, Physical>,
         element_is_opaque: bool,
-        element_states: &mut IndexMap<Id, ElementState<<F as ExportFramebuffer<A::Buffer>>::Framebuffer>>,
+        element_states: &mut HashMap<Id, ElementState<<F as ExportFramebuffer<A::Buffer>>::Framebuffer>>,
         primary_plane_elements: &[&'a E],
         scale: Scale<f64>,
         frame_state: &mut CompositorFrameState<A, F>,
@@ -3141,7 +3142,7 @@ where
         element: &'a E,
         element_zindex: usize,
         element_geometry: Rectangle<i32, Physical>,
-        element_states: &mut IndexMap<Id, ElementState<<F as ExportFramebuffer<A::Buffer>>::Framebuffer>>,
+        element_states: &mut HashMap<Id, ElementState<<F as ExportFramebuffer<A::Buffer>>::Framebuffer>>,
         scale: Scale<f64>,
         frame_state: &mut CompositorFrameState<A, F>,
         output_transform: Transform,
@@ -3694,7 +3695,7 @@ where
         element: &E,
         element_zindex: usize,
         element_geometry: Rectangle<i32, Physical>,
-        element_states: &'a mut IndexMap<Id, ElementState<<F as ExportFramebuffer<A::Buffer>>::Framebuffer>>,
+        element_states: &'a mut HashMap<Id, ElementState<<F as ExportFramebuffer<A::Buffer>>::Framebuffer>>,
         frame_state: &mut CompositorFrameState<A, F>,
         output_transform: Transform,
         output_geometry: Rectangle<i32, Physical>,
@@ -3948,7 +3949,7 @@ where
         element_zindex: usize,
         element_geometry: Rectangle<i32, Physical>,
         element_is_opaque: bool,
-        element_states: &mut IndexMap<Id, ElementState<<F as ExportFramebuffer<A::Buffer>>::Framebuffer>>,
+        element_states: &mut HashMap<Id, ElementState<<F as ExportFramebuffer<A::Buffer>>::Framebuffer>>,
         primary_plane_elements: &[&'a E],
         scale: Scale<f64>,
         frame_state: &mut CompositorFrameState<A, F>,

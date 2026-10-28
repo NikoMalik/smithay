@@ -93,13 +93,8 @@
 //! }
 //! ```
 
-use std::{
-    collections::{HashMap, VecDeque},
-    ops::Range,
-    sync::Once,
-};
+use std::{collections::VecDeque, ops::Range, sync::Once};
 
-use indexmap::IndexMap;
 use smallvec::{SmallVec, smallvec};
 use tracing::{info_span, instrument, trace, warn};
 
@@ -181,8 +176,8 @@ impl ElementState {
 struct RendererState {
     transform: Option<Transform>,
     size: Option<Size<i32, Physical>>,
-    elements: IndexMap<Id, ElementState>,
-    effects_cache: HashMap<Id, UserDataMap>,
+    elements: crate::utils::hash::HashMap<Id, ElementState>,
+    effects_cache: crate::utils::hash::HashMap<Id, UserDataMap>,
     old_damage: VecDeque<Vec<Rectangle<i32, Physical>>>,
     opaque_regions: Vec<Rectangle<i32, Physical>>,
     clear_color: Option<Color32F>,
@@ -492,7 +487,7 @@ impl OutputDamageTracker {
         self.element_damage_index.clear();
 
         let mut element_render_states = RenderElementStates {
-            states: HashMap::with_capacity(elements.len()),
+            states: crate::utils::hash::HashMap::with_capacity(elements.len()),
         };
 
         // we have to take the element damage to be able to move it around
@@ -635,7 +630,7 @@ impl OutputDamageTracker {
             .filter(|(id, _)| {
                 element_render_states
                     .states
-                    .get(id)
+                    .get(*id)
                     .map(|state| state.presentation_state == RenderElementPresentationState::Skipped)
                     .unwrap_or(true)
             })

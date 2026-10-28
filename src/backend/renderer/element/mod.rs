@@ -19,10 +19,7 @@
 //! See the [`damage`](crate::backend::renderer::damage) module for more information on
 //! damage tracking.
 
-use std::{
-    collections::HashMap,
-    sync::{Arc, Weak},
-};
+use std::sync::{Arc, Weak};
 
 #[cfg(feature = "wayland_frontend")]
 use wayland_server::{Resource, backend::ObjectId};
@@ -466,7 +463,7 @@ pub fn default_primary_scanout_output_compare<'a>(
 #[derive(Default, Debug, Clone)]
 pub struct RenderElementStates {
     /// Holds the render states of the elements
-    pub states: HashMap<Id, RenderElementState>,
+    pub states: crate::utils::hash::HashMap<Id, RenderElementState>,
 }
 
 impl RenderElementStates {
