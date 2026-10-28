@@ -118,9 +118,7 @@ use std::{any::Any, sync::Mutex};
 pub use self::cache::{Cacheable, CachedState, MultiCache};
 pub use self::handlers::{RegionUserData, SubsurfaceCachedState, SubsurfaceUserData, SurfaceUserData};
 use self::transaction::TransactionQueue;
-pub use self::transaction::{
-    Barrier, Blocker, BlockerKind, BlockerState, NotifyContext, NotifyKind, SurfaceBarrier,
-};
+pub use self::transaction::{Barrier, Blocker, BlockerState};
 pub use self::tree::{AlreadyHasRole, TraversalAction};
 use self::tree::{PrivateSurfaceData, SuggestedSurfaceState};
 use crate::input::touch::FrameMarker;
@@ -129,6 +127,7 @@ pub use crate::utils::hook::HookId;
 use crate::utils::{Buffer, Logical, Point, Rectangle, user_data::UserDataMap};
 use crate::wayland::GlobalData;
 use portable_atomic::AtomicF64;
+use smallvec::SmallVec;
 use wayland_server::backend::GlobalId;
 use wayland_server::protocol::wl_compositor::WlCompositor;
 use wayland_server::protocol::wl_subcompositor::WlSubcompositor;
@@ -553,7 +552,7 @@ pub fn remove_destruction_hook(surface: &WlSurface, hook_id: &HookId) {
 /// The module will only evaluate blocker states on commit. If a blocker
 /// becomes ready later, a call to [`CompositorClientState::blocker_cleared`] is necessary
 /// to trigger a re-evaluation.
-pub fn add_blocker(surface: &WlSurface, blocker: impl Blocker + Send + Sync + 'static) {
+pub fn add_blocker(surface: &WlSurface, blocker: impl Blocker + Send + 'static) {
     PrivateSurfaceData::add_blocker(surface, blocker)
 }
 
@@ -641,19 +640,14 @@ impl CompositorClientState {
     /// got `Released` or `Cancelled` from being `Pending` previously for any
     /// surface belonging to this client.
     pub fn blocker_cleared<D: CompositorHandler + 'static>(&self, state: &mut D, dh: &DisplayHandle) {
-        let (transactions, notifications) = if let Some(queue) = self.queue.lock().unwrap().as_mut() {
+        let transactions = if let Some(queue) = self.queue.lock().unwrap().as_mut() {
             queue.take_ready()
         } else {
-            Default::default()
+            SmallVec::new()
         };
 
         for transaction in transactions {
             transaction.apply(dh, state)
-        }
-
-        // notify delayed blockers, they might re-enter this function
-        for notification in notifications {
-            notification.deliver();
         }
     }
 
