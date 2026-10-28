@@ -78,7 +78,14 @@
 //!         .and_then(|state| state.borrow_mut().timestamp.take())
 //! });
 //! ```
-use std::{cell::RefCell, collections::BinaryHeap, sync::Mutex};
+use std::{
+    cell::RefCell,
+    collections::BinaryHeap,
+    sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 use rustix::fs::Timespec;
 use wayland_protocols::wp::commit_timing::v1::server::{
@@ -367,6 +374,19 @@ pub struct CommitTimerBarrierState {
     barriers: BinaryHeap<CommitTimerBarrier>,
 }
 
+static PENDING_BARRIERS: AtomicUsize = AtomicUsize::new(0);
+
+#[doc(hidden)]
+pub fn has_pending_barriers() -> bool {
+    PENDING_BARRIERS.load(Ordering::Relaxed) != 0
+}
+
+impl Drop for CommitTimerBarrierState {
+    fn drop(&mut self) {
+        PENDING_BARRIERS.fetch_sub(self.barriers.len(), Ordering::Relaxed);
+    }
+}
+
 impl<Kind> From<Time<Kind>> for Timestamp {
     fn from(value: Time<Kind>) -> Self {
         Self(value.into())
@@ -400,7 +420,9 @@ impl CommitTimerBarrierState {
             let _ = self.barriers.pop();
         }
 
-        num_barriers != self.barriers.len()
+        let signaled = num_barriers - self.barriers.len();
+        PENDING_BARRIERS.fetch_sub(signaled, Ordering::Relaxed);
+        signaled != 0
     }
 
     /// Register a new barrier with the provided timestamp
@@ -410,6 +432,7 @@ impl CommitTimerBarrierState {
             timestamp,
             barrier: barrier.clone(),
         });
+        PENDING_BARRIERS.fetch_add(1, Ordering::Relaxed);
         barrier
     }
 
@@ -437,5 +460,38 @@ impl std::cmp::PartialOrd for CommitTimerBarrier {
     #[inline]
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::utils::{Monotonic, Time};
+
+    fn ts(ms: u64) -> Timestamp {
+        Time::<Monotonic>::from(Duration::from_millis(ms)).into()
+    }
+
+    #[test]
+    fn pending_barriers_follow_register_signal_and_drop() {
+        let before = PENDING_BARRIERS.load(Ordering::Relaxed);
+
+        let mut state = CommitTimerBarrierState::default();
+        state.register(ts(10));
+        state.register(ts(20));
+        state.register(ts(30));
+        assert_eq!(PENDING_BARRIERS.load(Ordering::Relaxed), before + 3);
+        assert!(has_pending_barriers());
+
+        assert!(state.signal_until(ts(20)));
+        assert_eq!(PENDING_BARRIERS.load(Ordering::Relaxed), before + 1);
+
+        assert!(!state.signal_until(ts(25)));
+        assert_eq!(PENDING_BARRIERS.load(Ordering::Relaxed), before + 1);
+
+        drop(state);
+        assert_eq!(PENDING_BARRIERS.load(Ordering::Relaxed), before);
     }
 }
