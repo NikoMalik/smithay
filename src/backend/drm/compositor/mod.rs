@@ -1103,6 +1103,7 @@ where
     framebuffer_exporter: F,
 
     current_frame: CompositorFrameState<A, F>,
+    current_presentation_mode: PresentationMode,
     pending_frame: Option<PendingFrame<A, F, U>>,
     queued_frame: Option<QueuedFrame<A, F, U>>,
     next_frame: Option<PreparedFrame<A, F>>,
@@ -1286,6 +1287,7 @@ where
                         reset_pending: true,
                         signaled_fence,
                         current_frame,
+                        current_presentation_mode: PresentationMode::VSync,
                         pending_frame: None,
                         queued_frame: None,
                         next_frame: None,
@@ -1468,6 +1470,7 @@ where
             reset_pending: true,
             signaled_fence,
             current_frame,
+            current_presentation_mode: PresentationMode::VSync,
             pending_frame: None,
             queued_frame: None,
             next_frame: None,
@@ -2819,13 +2822,16 @@ where
     #[profiling::function]
     pub fn frame_submitted(&mut self) -> FrameResult<U, A, F> {
         let Some(PendingFrame {
-            mut frame, user_data, ..
+            mut frame,
+            user_data,
+            presentation_mode,
         }) = self.pending_frame.take()
         else {
             return Err(FrameError::EmptyFrame);
         };
 
         std::mem::swap(&mut frame, &mut self.current_frame);
+        self.current_presentation_mode = presentation_mode;
         if self.queued_frame.is_some() {
             self.submit()?;
         }
@@ -4313,8 +4319,8 @@ where
         let presentation_mode_unchanged = self
             .pending_frame
             .as_ref()
-            .map(|frame| frame.presentation_mode == presentation_mode)
-            .unwrap_or(false);
+            .map_or(self.current_presentation_mode, |frame| frame.presentation_mode)
+            == presentation_mode;
 
         let res = if is_compatible && presentation_mode_unchanged {
             trace!(
