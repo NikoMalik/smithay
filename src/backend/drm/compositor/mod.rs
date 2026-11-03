@@ -2648,6 +2648,7 @@ where
             self.queued_frame = None;
             self.pending_frame = None;
             self.current_frame = prepared_frame.frame;
+            self.current_presentation_mode = PresentationMode::VSync;
         }
 
         res.map(|_| ())
@@ -2665,6 +2666,7 @@ where
     pub fn reset_state(&mut self) -> Result<(), DrmError> {
         self.surface.reset_state()?;
         self.reset_pending = true;
+        self.current_presentation_mode = PresentationMode::VSync;
         Ok(())
     }
 
